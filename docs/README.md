@@ -93,9 +93,3 @@ Ejemplo de manifiesto (`GET /v1/files/manifest`): `{"file_id","version":3,"size"
 
 ## Estructura
 `dfsha/controller.py` (Raft + API + reparación/GC) · `dfsha/datanode.py` · `dfsha/client.py` · `dfsha/cli.py` · `dfsha/common.py` · `scripts/` (certificados, clúster local) · `tests/run_tests.py` · `deploy/` · `docs/DECISIONES.md` · `results/`.
-
-## Pendiente antes de entregar (responsabilidad del equipo)
-1. Pedir al profesor la aprobación escrita de D3 (consenso por librería), según la sección 7 del enunciado. D4 (escritura parcial) ya no es una simplificación: se implementó la modificación por bloque.
-2. Desplegar en AWS Academy y capturar evidencia real (ver pasos arriba); repetir las mediciones allí.
-3. Informe final, video de 10–15 min y repositorio con commits por integrante.
-4. Cada integrante debe poder explicar el código completo en la defensa: lean `controller.py` (máquina de estados y commit) y `client.py` (`_send_block`) con especial atención.
