@@ -6,3 +6,8 @@ certs/
 env
 .env
 /tmp/
+
+deploy/hosts.txt
+deploy/*.generated.*
+deploy/logs/
+secrets*.env

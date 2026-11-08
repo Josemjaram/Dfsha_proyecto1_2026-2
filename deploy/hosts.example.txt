@@ -1,0 +1,10 @@
+# nombre  ip_privada  ip_publica     (la IP pública solo se usa para entrar por SSH; si corre el script desde dentro de la VPC, repita la privada)
+# Reglas: c1 c2 c3 = controladores (exactamente 3) · n1..nN = nodos de datos (mínimo 4) · cli = cliente (opcional)
+c1   10.0.1.11   3.80.0.11
+c2   10.0.1.12   3.80.0.12
+c3   10.0.1.13   3.80.0.13
+n1   10.0.1.21   3.80.0.21
+n2   10.0.1.22   3.80.0.22
+n3   10.0.1.23   3.80.0.23
+n4   10.0.1.24   3.80.0.24
+cli  10.0.1.30   3.80.0.30
