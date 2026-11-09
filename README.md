@@ -31,55 +31,57 @@ API Python (RF3): `c.open(path,'r'|'w'|'a'|'x')` → `read/seek/write/close/abor
 python tests/run_tests.py            # ~6 min; escribe results/report.md y results/perf.csv
 python tests/run_tests.py --only seguridad
 ```
-| Prueba del enunciado | Función | Evidencia |
-|---|---|---|
-| Carga y recuperación | `t_carga_recuperacion` | 64 MiB en 16 bloques sobre 4 nodos, 3 copias, hash idéntico |
-| Acceso RF3 | `t_rf3` | open/read/write/close/lock, snapshot, abortar, `expected_version` |
-| Modificación por bloque (RF3) | `t_modificacion_bloque` | 1 byte → solo 1 bloque nuevo (los demás se comparten), rango que cruza bloques, snapshot anterior intacto, 423/412/416, GC libera solo los bloques reemplazados |
-| Concurrencia | `t_concurrencia` | 423 al segundo escritor, carrera de 6 hilos sin mezcla, escritor zombi rechazado (fencing) |
-| Replicación y fallos | `t_fallos_nodo`, `t_nodo_cae_durante_escritura` | lectura/escritura con nodo caído, detección, reparación a 3 copias, reingreso del nodo |
-| Consistencia | `t_replica_retrasada` | réplica congelada durante una escritura: se publica con ≥2 copias, lectores ven la versión nueva completa, la réplica se repone |
-| Seguridad | `t_seguridad` | 401/403, tokens acotados, TLS 1.3, CA desconocida rechazada, texto plano ausente en disco, bloque alterado detectado y reparado |
-| Rendimiento | `t_rendimiento` | tamaño de bloque (1/4/8 MiB) y clientes (1/2/4); mediana y p95 |
-| Extras | `t_escritura_interrumpida`, `t_gc_versiones`, `t_failover_controlador` | bloque parcial rechazado, huérfanos limpiados, GC, failover de líder y pérdida de mayoría |
+| Prueba del enunciado          | Función                                                                | Evidencia                                                                                                                                                       |
+| ----------------------------- | ---------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Carga y recuperación          | `t_carga_recuperacion`                                                 | 64 MiB en 16 bloques sobre 4 nodos, 3 copias, hash idéntico                                                                                                     |
+| Acceso RF3                    | `t_rf3`                                                                | open/read/write/close/lock, snapshot, abortar, `expected_version`                                                                                               |
+| Modificación por bloque (RF3) | `t_modificacion_bloque`                                                | 1 byte → solo 1 bloque nuevo (los demás se comparten), rango que cruza bloques, snapshot anterior intacto, 423/412/416, GC libera solo los bloques reemplazados |
+| Concurrencia                  | `t_concurrencia`                                                       | 423 al segundo escritor, carrera de 6 hilos sin mezcla, escritor zombi rechazado (fencing)                                                                      |
+| Replicación y fallos          | `t_fallos_nodo`, `t_nodo_cae_durante_escritura`                        | lectura/escritura con nodo caído, detección, reparación a 3 copias, reingreso del nodo                                                                          |
+| Consistencia                  | `t_replica_retrasada`                                                  | réplica congelada durante una escritura: se publica con ≥2 copias, lectores ven la versión nueva completa, la réplica se repone                                 |
+| Seguridad                     | `t_seguridad`                                                          | 401/403, tokens acotados, TLS 1.3, CA desconocida rechazada, texto plano ausente en disco, bloque alterado detectado y reparado                                 |
+| Rendimiento                   | `t_rendimiento`                                                        | tamaño de bloque (1/4/8 MiB) y clientes (1/2/4); mediana y p95                                                                                                  |
+| Extras                        | `t_escritura_interrumpida`, `t_gc_versiones`, `t_failover_controlador` | bloque parcial rechazado, huérfanos limpiados, GC, failover de líder y pérdida de mayoría                                                                       |
 
 > Los números de `results/` salieron de **1 vCPU en localhost**: sirven para validar corrección, no como mediciones de AWS. Repita `t_rendimiento` en AWS (≥5 repeticiones) y reporte esas cifras.
 
-## Despliegue en AWS Academy (pasos)
-> Guía detallada con comandos, guion de evidencia y solución de problemas: [`docs/GUIA_AWS.md`](docs/GUIA_AWS.md). Mediciones contra el clúster desplegado: `python scripts/aws_bench.py --help`.
+## Despliegue en AWS Academy (4 VMs, casi automático)
+Topología: vm1-vm3 = controlador + nodo de datos (contenedores separados); vm4 = nodo de datos + cliente. Detalle, tiempos, solución de problemas y plan B manual en [`docs/GUIA_AWS.md`](docs/GUIA_AWS.md).
 
-1. VPC/subred privada; 3 VMs de control + ≥4 de datos + 1 cliente en la misma VPC (verifique el límite de instancias de su Learner Lab). Security group: solo tráfico interno en 8001, 4321 (Raft) y 9001.
-2. Certificados: **uno por nodo**, firmados por una CA propia. En su equipo (no en las VMs):
-   `python scripts/gen_certs.py certs --node c1=10.0.1.11 --node c2=10.0.1.12 --node c3=10.0.1.13 --node n1=10.0.1.21 --node n2=10.0.1.22 --node n3=10.0.1.23 --node n4=10.0.1.24`
-   A cada VM copie solo `certs/ca.pem` y `certs/<su nodo>/server.pem|server.key` (a `/opt/dfsha/certs/`), más `cluster.json` (ver `deploy/cluster.example.json`) a `/opt/dfsha/`. **Nunca** copie `certs/ca.key` a las VMs ni lo suba al repositorio.
-3. Secretos: cree `/opt/dfsha/env` en cada VM (`openssl rand -hex 32` para cada valor, fuera del repo). **Son obligatorios**: sin ellos el proceso no arranca (solo `DFSHA_DEV=1` permite valores de desarrollo; no lo use en AWS).
-   - `DFSHA_CLUSTER_KEY`: igual en todas las VMs (firma de tokens, acuses y canal Raft).
-   - `DFSHA_ADMIN_KEY`: en las VMs de control (consulta `cluster` del operador).
-   - `DFSHA_NODE_KEY`: en las VMs de datos; puede ser **distinta por nodo**, porque las réplicas viajan en claro dentro de TLS y cada nodo vuelve a cifrar con su propia llave.
-4. `docker build -t dfsha .` en cada VM; `deploy/run_controller.sh c1 <ip>` / `deploy/run_datanode.sh n1 <ip>`.
-5. En la VM cliente exporte `DFSHA_CONTROLLERS` y `DFSHA_CA`. Las IPs privadas se conservan al detener/iniciar el lab; las públicas no: no las use en la configuración.
-6. Inyección de fallos en AWS: `docker stop dfsha-n1` (caída: **no** se reinicia solo, es una parada manual; reinícielo con `docker start`), `docker kill dfsha-n1` (caída abrupta: Docker lo levanta de nuevo por `--restart unless-stopped`, evidencia del reinicio automático), `docker pause dfsha-n2` (réplica desconectada), `docker kill` del líder (failover).
+```bash
+# una vez: credenciales del Learner Lab en ~/.aws/credentials y labsuser.pem descargada
+export SSH_KEY=~/labsuser.pem SSH_USER=ec2-user AWS_REGION=us-east-1
+bash deploy/aws_crear_vms.sh        # crea las 4 VMs y escribe deploy/hosts.txt
+bash deploy/desplegar.sh            # secretos, certificados por VM, Docker, arranque y prueba de punta a punta
+bash deploy/evidencia_aws.sh        # fallas (stop/kill/pause), seguridad, rendimiento -> carpeta evidencia/
+bash deploy/aws_crear_vms.sh detener    # al terminar: ahorra presupuesto
+```
+- Los secretos (`DFSHA_CLUSTER_KEY`, `DFSHA_ADMIN_KEY`, `DFSHA_NODE_KEY`) son obligatorios y los genera `desplegar.sh` en `deploy/secrets.generated.env` (fuera del repositorio). `DFSHA_NODE_KEY` es distinta por nodo: las réplicas viajan en claro dentro de TLS y cada nodo vuelve a cifrar con su propia llave.
+- Un certificado por VM (lo comparten el controlador y el nodo de datos de esa VM), firmado por una CA propia; `certs/ca.key` nunca sale del computador.
+- Inyección de fallas: `docker stop` (parada manual: **no** se reinicia sola), `docker kill` (Docker lo levanta por `--restart unless-stopped`), `docker pause` (réplica desconectada), detener al líder (failover). `evidencia_aws.sh` ejecuta todo y guarda la salida.
+- **Estado de verificación**: scripts probados en simulación y el código en un clúster local; **pendiente de ejecutar en AWS**.
+- Limitación declarada: controlador y nodo de datos comparten VM (reduce el aislamiento de fallas, no el software).
 
 ### Agregar un nodo de datos (sin tocar los demás)
-1. `python scripts/gen_certs.py certs --node n5=10.0.1.25` (reutiliza la CA existente; no cambia los certificados de los demás nodos).
-2. En la VM nueva: copiar `certs/ca.pem`, `certs/n5/server.*`, `cluster.json` y crear `/opt/dfsha/env`; `docker build -t dfsha .` y `deploy/run_datanode.sh n5 10.0.1.25`.
+1. `python scripts/gen_certs.py certs --node vm5=10.0.1.25` (reutiliza la CA existente; no cambia los certificados de los demás nodos).
+2. En la VM nueva: copiar `certs/ca.pem`, `certs/<vm>/server.*`, `cluster.json` y crear `/opt/dfsha/env`; `docker build -t dfsha .` y `sudo bash deploy/run_datanode.sh n5 10.0.1.25`. (O agregar la VM a `deploy/hosts.txt` con el rol `n5` y repetir `desplegar.sh`.)
 3. El nodo se registra solo por heartbeat y recibe bloques nuevos y reparaciones. **No hay rebalanceo** de los bloques ya existentes. Los 3 controladores son fijos (están en `cluster.json`; cambiarlos exige editarlo y reiniciar).
 
 ### Limitaciones conocidas
 Ver `docs/DECISIONES.md` §4 (incluye: reescritura completa al modificar un archivo, detección de corrupción solo al leer, sin rebalanceo, controladores fijos, metadatos en memoria con un único líder).
 
 ## API de control (REST/HTTPS, JSON)
-| Operación | Endpoint | Errores relevantes |
-|---|---|---|
-| registro / login | `POST /v1/register`, `POST /v1/login` | 401 credenciales |
-| namespace | `GET /v1/ls`, `GET /v1/stat`, `POST /v1/mkdir`, `POST /v1/rmdir`, `DELETE /v1/files` | 404, 409 NOT_EMPTY/EXISTS |
+| Operación         | Endpoint                                                                                            | Errores relevantes                                                                           |
+| ----------------- | --------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| registro / login  | `POST /v1/register`, `POST /v1/login`                                                               | 401 credenciales                                                                             |
+| namespace         | `GET /v1/ls`, `GET /v1/stat`, `POST /v1/mkdir`, `POST /v1/rmdir`, `DELETE /v1/files`                | 404, 409 NOT_EMPTY/EXISTS                                                                    |
 | iniciar escritura | `POST /v1/uploads` `{path, mode ∈ create\|replace\|append\|modify, expected_version?, block_size?}` | 423 LOCKED, 412 VERSION_CONFLICT, 409 EXISTS, 404 NOT_FOUND (modify), 503 INSUFFICIENT_NODES |
-| ubicaciones | `POST /v1/uploads/{id}/allocate`, `/reassign`, `/renew` | 409 LEASE_EXPIRED |
-| publicar | `POST /v1/uploads/{id}/commit` `{blocks:[{index,id,len,sha,acks}], content_sha256}` | 422 INSUFFICIENT_REPLICAS, 409 LEASE_EXPIRED, 503 NO_QUORUM |
-| abortar | `POST /v1/uploads/{id}/abort` | — |
-| lectura | `GET /v1/files/manifest?path=&version=` | 404, 410 VERSION_EXPIRED |
-| locks | `POST /v1/locks`, `POST /v1/locks/renew`, `DELETE /v1/locks` | 423 |
-| estado (operador) | `GET /v1/cluster` con `X-Admin-Key` | 403 |
+| ubicaciones       | `POST /v1/uploads/{id}/allocate`, `/reassign`, `/renew`                                             | 409 LEASE_EXPIRED                                                                            |
+| publicar          | `POST /v1/uploads/{id}/commit` `{blocks:[{index,id,len,sha,acks}], content_sha256}`                 | 422 INSUFFICIENT_REPLICAS, 409 LEASE_EXPIRED, 503 NO_QUORUM                                  |
+| abortar           | `POST /v1/uploads/{id}/abort`                                                                       | —                                                                                            |
+| lectura           | `GET /v1/files/manifest?path=&version=`                                                             | 404, 410 VERSION_EXPIRED                                                                     |
+| locks             | `POST /v1/locks`, `POST /v1/locks/renew`, `DELETE /v1/locks`                                        | 423                                                                                          |
+| estado (operador) | `GET /v1/cluster` con `X-Admin-Key`                                                                 | 403                                                                                          |
 
 Nodos de datos: `PUT/GET /blocks/{id}` (token `data`), `DELETE /blocks/{id}` y `/internal/*` (token `svc`). Errores: 401 sin/alterado/vencido, 403 token fuera de alcance, 422 hash o bloque corrupto.
 
@@ -92,4 +94,4 @@ Ejemplo de manifiesto (`GET /v1/files/manifest`): `{"file_id","version":3,"size"
 - Garantías formales y decisiones: `docs/DECISIONES.md`.
 
 ## Estructura
-`dfsha/controller.py` (Raft + API + reparación/GC) · `dfsha/datanode.py` · `dfsha/client.py` · `dfsha/cli.py` · `dfsha/common.py` · `scripts/` (certificados, clúster local) · `tests/run_tests.py` · `deploy/` · `docs/DECISIONES.md` · `results/`.
+`dfsha/controller.py` (Raft + API + reparación/GC) · `dfsha/datanode.py` · `dfsha/client.py` · `dfsha/cli.py` · `dfsha/common.py` · `scripts/` (certificados, clúster local) · `tests/run_tests.py` · `deploy/` (creación de VMs, despliegue y evidencia en AWS) · `docs/` (decisiones y guía de AWS) · `results/` · `evidencia/` (se genera en AWS).
