@@ -1,208 +1,101 @@
-# Guía de despliegue de DFSha en AWS Academy (Learner Lab)
+# Guía de despliegue en AWS Academy: 4 VMs, casi todo automático
 
-Objetivo: dejar corriendo **3 controladores (Raft) + 4 nodos de datos + 1 cliente**, demostrar las fallas que pide el PDF y recolectar la evidencia (capturas, logs, CSV) para el informe y el video.
+Objetivo: dejar DFSha corriendo en **4 máquinas virtuales** del Learner Lab, demostrar las fallas que pide el enunciado y guardar la evidencia, haciendo a mano lo mínimo. El enunciado pide desplegar en máquinas virtuales de AWS Academy, con procesos o contenedores separados, y demostrar comunicación real entre nodos por red; no exige un número de VMs.
 
-> Todo lo que está aquí se probó en un clúster local (14/14 pruebas). **Lo que no se pudo probar fuera de AWS**: Docker (construcción de la imagen y reinicio automático con `docker kill`), el límite real de instancias de su Learner Lab y los tiempos de red reales. Anótenlo como "verificado en AWS" en el informe solo cuando lo ejecuten allí.
+> **Estado de verificación.** El código se probó en un clúster local (14/14 pruebas) y los scripts de esta guía se probaron en simulación (sin AWS). **Ninguno se ha ejecutado todavía en AWS.** Si un paso falla, el mensaje dice qué falló; la sección "Si algo falla" lista lo más probable. Escriban "verificado en AWS" en el informe solo cuando lo hayan ejecutado.
 
-Convención de IPs de esta guía (cámbienlas por las suyas, **siempre privadas**):
+## 1. Qué se monta
 
-| Rol | Nombre | IP privada |
+| VM | Contenedores Docker | Rol |
 |---|---|---|
-| Controlador | c1, c2, c3 | 10.0.1.11, 10.0.1.12, 10.0.1.13 |
-| Nodo de datos | n1, n2, n3, n4 | 10.0.1.21 … 10.0.1.24 |
-| Cliente | cli | 10.0.1.30 |
+| vm1 | `dfsha-c1` + `dfsha-n1` | controlador Raft 1 + nodo de datos 1 |
+| vm2 | `dfsha-c2` + `dfsha-n2` | controlador Raft 2 + nodo de datos 2 |
+| vm3 | `dfsha-c3` + `dfsha-n3` | controlador Raft 3 + nodo de datos 3 |
+| vm4 | `dfsha-n4` + el cliente | nodo de datos 4 + CLI y pruebas |
 
-Si el Learner Lab no deja crear 8 instancias, ver el apartado "Plan B si hay pocas instancias" al final.
+- Sigue habiendo 3 controladores (Raft con mayoría 2 de 3) y 4 nodos de datos, en **procesos separados dentro de contenedores separados**, y toda la comunicación entre VMs va por la red privada con HTTPS/TLS 1.3.
+- Los 3 controladores están en VMs distintas: se tolera la caída de una VM completa. Cuando cae una VM caen a la vez un controlador y un nodo de datos; quedan 2 controladores y 3 nodos, suficientes para seguir (la escritura confirma con 2 copias y la tercera se repone en los 3 nodos vivos).
+- **Limitación a declarar en el informe**: por el presupuesto y límites del Learner Lab se comparten VMs entre controlador y nodo de datos. No cambia el software; solo reduce el aislamiento de fallas.
 
----
+## 2. Una sola vez, en su computador
 
-## Camino rápido: despliegue automático con `deploy/desplegar.sh`
-
-Si ya crearon las 8 VMs (paso 1) y el security group, este script hace los pasos 2 a 6 por SSH desde su computador (Linux, macOS, WSL o Git Bash; necesita `python3`, `openssl`, `ssh` y `scp`):
-
-```bash
-pip install -r requirements.txt                    # para generar los certificados
-cp deploy/hosts.example.txt deploy/hosts.txt       # edite: nombre  ip_privada  ip_publica
-export SSH_KEY=~/llave-aws.pem                     # la .pem de AWS Academy
-export SSH_USER=ec2-user                           # ubuntu si las VMs son Ubuntu
-DRY_RUN=1 bash deploy/desplegar.sh                 # opcional: muestra lo que haría, sin tocar las VMs
-bash deploy/desplegar.sh
-```
-
-Genera los secretos (`deploy/secrets.generated.env`), la CA y un certificado por nodo, instala Docker, copia el código, construye la imagen, arranca los 3 controladores y luego los nodos de datos, prepara el cliente y termina con una prueba de punta a punta (sube 32 MiB, los baja y compara el hash). Se puede repetir sin problema. Las VMs se siguen creando a mano en la consola de AWS.
-
-Qué se verificó y qué no: la generación de secretos, certificados y `cluster.json`, y el orden de los pasos, se probaron en modo simulación (`DRY_RUN=1`). **La parte por SSH contra VMs reales no se pudo probar fuera de AWS**: si algo falla, el script dice en qué VM y deja el registro en `deploy/logs/<nombre>.log`; los pasos manuales de abajo siguen siendo válidos.
-
-Después del script, sigan en la sección 7 (guion de evidencia) y la 8 (mediciones).
-
----
-
-## 0. Antes de empezar (en su computador)
-
-1. Tener el repositorio (o el zip) con el código. No necesitan haberlo subido a GitHub para empezar (ver la respuesta sobre GitHub en la conversación), pero **jamás** deben subir `certs/`, `env` ni llaves (`.gitignore` ya los excluye).
-2. Python 3.10+ con `pip install -r requirements.txt` (para generar certificados).
-3. Un par de llaves SSH (`.pem` de AWS Academy) para entrar a las VMs.
-
-## 1. Red y máquinas
-
-1. **VPC**: usen la VPC por defecto o creen una; una subred es suficiente. Es importante que todas las VMs estén en la misma VPC.
-2. **Security group `dfsha-sg`** (uno solo para todas las VMs):
-   - Entrada TCP 22 desde su IP (para SSH).
-   - Entrada TCP 8001, 4321 y 9001 **solo desde el propio security group** (origen = `dfsha-sg`). 4321 es Raft entre controladores, 8001 es la API de controladores y 9001 la de nodos de datos.
-   - Nada más abierto. En particular, no abran 8001/9001 a `0.0.0.0/0`.
-3. **Instancias**: 8 × `t3.small` o `t3.medium` (Amazon Linux 2023 o Ubuntu 22.04), disco de 20–30 GB. Nómbrenlas `dfsha-c1`… `dfsha-cli`. Para que las IPs coincidan con la tabla, fijen la IP privada al crear cada instancia (Configuración de red → IP privada principal).
-4. Las **IP privadas se conservan** al detener/iniciar el lab; las públicas cambian. Usen solo las privadas en `cluster.json` y en los certificados.
-
-## 2. Certificados (en su computador, no en las VMs)
-
-```bash
-python scripts/gen_certs.py certs \
-  --node c1=10.0.1.11 --node c2=10.0.1.12 --node c3=10.0.1.13 \
-  --node n1=10.0.1.21 --node n2=10.0.1.22 --node n3=10.0.1.23 --node n4=10.0.1.24
-```
-
-Resultado: `certs/ca.pem`, `certs/ca.key` y `certs/<nodo>/server.pem|server.key`.
-
-- A cada VM le copian **solo** `ca.pem` y la carpeta de **su** nodo. A la VM cliente solo `ca.pem`.
-- `ca.key` (la llave que firma todo) **no sale de su computador** y no va al repositorio.
-
-## 3. Secretos y configuración
-
-1. Generen los secretos **una sola vez** en su computador y guárdenlos en un lugar privado (gestor de contraseñas):
-
+1. Instalar: Git, Python 3.10 o superior, OpenSSL, `ssh`/`scp` y la [AWS CLI](https://aws.amazon.com/cli/). En Windows usen **WSL (Ubuntu)** y trabajen dentro de WSL: los scripts son de bash.
+2. Clonar el repositorio y, dentro de la carpeta: `pip install -r requirements.txt`.
+3. En el Learner Lab, botón **Start Lab**. Cuando el círculo esté en verde, abran **AWS Details**:
+   - **AWS CLI: Show** → copien el bloque a `~/.aws/credentials`. Cambia cada vez que reinicien el laboratorio y dura unas 4 horas.
+   - **Download PEM** → `labsuser.pem`; luego `chmod 400 labsuser.pem`.
+4. Exporten (cada vez que abran una terminal):
    ```bash
-   echo "DFSHA_CLUSTER_KEY=$(openssl rand -hex 32)"
-   echo "DFSHA_ADMIN_KEY=$(openssl rand -hex 32)"
-   echo "DFSHA_NODE_KEY_n1=$(openssl rand -hex 32)"   # una por nodo de datos (pueden ser distintas)
+   export SSH_KEY=~/labsuser.pem
+   export SSH_USER=ec2-user
+   export AWS_REGION=us-east-1        # la región del laboratorio (arriba a la izquierda en la consola)
    ```
 
-2. Archivo `/opt/dfsha/env` en cada VM (permisos 600). No hace falta escribir `export`: los scripts de despliegue ya lo hacen por ustedes.
-   - Controladores (c1–c3):
-     ```
-     DFSHA_CLUSTER_KEY=<el mismo en TODAS las VMs>
-     DFSHA_ADMIN_KEY=<el mismo en los 3 controladores>
-     ```
-   - Nodos de datos (n1–n4):
-     ```
-     DFSHA_CLUSTER_KEY=<el mismo en TODAS las VMs>
-     DFSHA_NODE_KEY=<la de ese nodo>
-     ```
-   Sin estos valores el proceso **se niega a arrancar** (es intencional; `DFSHA_DEV=1` es solo para desarrollo local, no lo usen en AWS).
-3. `/opt/dfsha/cluster.json`: partan de `deploy/cluster.example.json`, ajusten las IPs y déjenlo igual en las 7 VMs (c1–c3, n1–n4). No cambien `retention` (360) a un valor menor que `read_ttl` (300).
-
-## 4. Preparar cada VM (las 7 de servidor)
-
-Por SSH, en cada una (ajusten la instalación de Docker a su sistema: `dnf` en Amazon Linux, `apt` en Ubuntu):
+## 3. Los cinco comandos
 
 ```bash
-sudo dnf install -y docker git        # Ubuntu: sudo apt-get install -y docker.io git
-sudo systemctl enable --now docker    # arranca Docker solo tras un reinicio de la VM
-sudo usermod -aG docker $USER         # cierren sesión y vuelvan a entrar
-sudo mkdir -p /opt/dfsha/certs /var/lib/dfsha-state /var/lib/dfsha-data
-sudo chown -R $USER /opt/dfsha
+bash deploy/aws_crear_vms.sh        # 1. crea las 4 VMs, el grupo de seguridad y escribe deploy/hosts.txt   (~3 min)
+bash deploy/desplegar.sh            # 2. instala Docker, copia todo, construye, arranca y prueba de punta a punta (~10 min)
+bash deploy/evidencia_aws.sh        # 3. inyecta las fallas, guarda la salida en evidencia/ y mide rendimiento   (~25 min)
+bash deploy/aws_crear_vms.sh detener   # 4. al terminar la sesión: detiene las VMs para ahorrar presupuesto
+bash deploy/aws_crear_vms.sh iniciar   # 5. al volver: las inicia y actualiza hosts.txt (las IP públicas cambian; las privadas no)
 ```
 
-Copien (con `scp`): el código del proyecto a `~/dfsha`, `cluster.json`, `ca.pem`, la carpeta del nodo y el archivo `env`:
+Detalle de cada uno:
 
-```bash
-scp -i llave.pem -r dfsha-proyecto/ ec2-user@<IP_PUBLICA>:~/dfsha
-scp -i llave.pem certs/ca.pem certs/c1/server.pem certs/c1/server.key ec2-user@<IP_PUBLICA>:/opt/dfsha/certs/
-scp -i llave.pem cluster.json env-c1 ec2-user@<IP_PUBLICA>:/opt/dfsha/   # luego: mv env-c1 env; chmod 600 env
-```
+1. **`aws_crear_vms.sh`** crea 4 instancias `t3.small` con Amazon Linux 2023 y 20 GB, con la llave `vockey` del laboratorio. El grupo de seguridad `dfsha-sg` abre SSH solo desde su IP y los puertos 8001 (API de controladores), 4321 (Raft) y 9001 (nodos de datos) solo entre las VMs. Escribe `deploy/hosts.txt`.
+2. **`desplegar.sh`** genera los secretos (`deploy/secrets.generated.env`), la CA y un certificado por VM, y el `cluster.json`. En cada VM instala Docker, copia el código, construye la imagen y arranca los contenedores (controladores primero). Termina con una prueba de punta a punta: sube 32 MiB, los baja y compara el hash. Se puede repetir sin problema. Antes de la primera vez pueden ver lo que haría con `DRY_RUN=1 bash deploy/desplegar.sh`.
+3. **`evidencia_aws.sh`** ejecuta los pasos 00 a 12 (ver la tabla de abajo). Para repetir solo algunos: `bash deploy/evidencia_aws.sh 03 05`.
 
-Construyan la imagen: `cd ~/dfsha && docker build -t dfsha .` (una vez por VM).
+## 4. Qué demuestra cada paso de la evidencia
 
-## 5. Arrancar el clúster
+| Paso | Qué hace | Prueba del enunciado | Resultado esperado |
+|---|---|---|---|
+| 00 | `docker ps` en cada VM y `curl` HTTPS entre VMs | comunicación real por red | contenedores en 4 VMs; `/health` responde entre VMs |
+| 01 | sube 64 MiB (16 bloques de 4 MiB) y los recupera | carga y recuperación | bloques en 4 nodos; hash idéntico; 3 copias |
+| 02 | `docker stop` de n1; lee y escribe; lo vuelve a iniciar | replicación y fallos | lecturas y escrituras siguen; n1 pasa a DEAD; se repara a 3 copias |
+| 03 | `docker kill` de n2 | disponibilidad / reinicio automático | Docker lo levanta solo (`RestartCount` ≥ 1) |
+| 04 | `docker pause` de n3 durante una escritura | consistencia | la escritura confirma con ≥ 2 copias; al volver, n3 se pone al día |
+| 05 | detiene al líder de Raft | alta disponibilidad | nuevo líder y escritura aceptada en pocos segundos |
+| 06 | detiene 2 de los 3 controladores | consistencia fuerte (CP) | respuesta 503: no opera sin mayoría; al volver, nada se perdió |
+| 07 | dos clientes escriben el mismo archivo | concurrencia | el segundo recibe 423 LOCKED; sin mezcla de bytes |
+| 08 | cambia 1 byte de un archivo de 4 bloques | acceso RF3 | solo se reenvía 1 bloque; los otros 3 se comparten |
+| 09 | accesos con y sin token, otro usuario, TLS | seguridad | 401/403 donde corresponde; TLS 1.3; CA desconocida rechazada |
+| 10 | busca texto plano en los discos y altera 1 byte de un bloque | seguridad (reposo e integridad) | 0 coincidencias de texto plano; lecturas correctas y copia mala repuesta |
+| 11 | `aws_bench.py`, 5 repeticiones | rendimiento (≥ 2 condiciones) | `evidencia/aws_perf.csv` con mediana y p95 |
+| 12 | guarda los logs de cada contenedor | trazabilidad | `evidencia/logs/` |
 
-Primero los 3 controladores (uno por VM), luego los nodos de datos:
+Cada archivo de `evidencia/` lleva fecha y hora. Al terminar, `evidencia/resumen.txt` lista el código de salida del último comando de cada paso. Revisen los archivos a mano: `FALLÓ` en alguna línea significa que esa comprobación no se cumplió.
 
-```bash
-# en la VM c1 (y análogo en c2 y c3 con su id e IP)
-cd ~/dfsha && ./deploy/run_controller.sh c1 10.0.1.11
+## 5. Qué guardar para el informe y el video
 
-# en la VM n1 (y análogo en n2, n3, n4)
-cd ~/dfsha && ./deploy/run_datanode.sh n1 10.0.1.21
-```
+- La carpeta `evidencia/` completa (se puede subir al repositorio: no contiene secretos).
+- Capturas de la consola de AWS: las 4 instancias, el grupo de seguridad y una terminal con `deploy/hosts.txt`.
+- Para el video: ejecuten los pasos 02, 05 y 06 en vivo (o muestren la salida ya grabada) con una terminal con `docker logs -f dfsha-c1` al lado.
+- En el informe: tipo de instancia, región, la limitación de las VMs compartidas y que las cifras son de AWS (las de `results/` son de localhost y no valen como mediciones de AWS).
 
-Los contenedores quedan con `--restart unless-stopped`: Docker los vuelve a levantar si el proceso muere o si la VM se reinicia. Revisen:
-
-```bash
-docker ps
-docker logs --tail 30 dfsha-c1      # busquen "líder" / "listo" y que no haya errores de TLS
-```
-
-Esperen ~10 s a que Raft elija líder y los nodos de datos envíen su primer heartbeat.
-
-## 6. Cliente
-
-En la VM `cli` (instalen Python y dependencias, copien el código y `ca.pem`):
-
-```bash
-sudo dnf install -y python3-pip && cd ~/dfsha && pip3 install -r requirements.txt
-export DFSHA_CONTROLLERS=https://10.0.1.11:8001,https://10.0.1.12:8001,https://10.0.1.13:8001
-export DFSHA_CA=/opt/dfsha/certs/ca.pem
-./dfsha-cli register --user ana --password clave12345   # solo la primera vez
-./dfsha-cli login --user ana --password clave12345
-./dfsha-cli mkdir /pruebas
-head -c 64M /dev/urandom > /tmp/grande.bin
-./dfsha-cli put /tmp/grande.bin /pruebas/grande.bin
-./dfsha-cli get /pruebas/grande.bin /tmp/grande.copia
-sha256sum /tmp/grande.bin /tmp/grande.copia      # deben ser idénticos
-./dfsha-cli ls /pruebas
-```
-
-(`./dfsha-cli --help` lista todos los subcomandos.)
-
-Verificación del clúster: `./dfsha-cli cluster --admin-key <DFSHA_ADMIN_KEY>` debe mostrar 3 controladores y ≥4 nodos vivos. Hagan una captura.
-
-## 7. Qué demostrar y cómo (guion para la evidencia)
-
-Para cada ítem: **comando → qué debe pasar → qué capturar**. Dejen una terminal con `docker logs -f` del líder visible.
-
-| # | Prueba | Comando | Resultado esperado | Evidencia |
-|---|---|---|---|---|
-| 1 | Carga y recuperación | `put` y `get` de 64 MiB, `sha256sum` | hashes idénticos | captura de ambos hashes |
-| 2 | Replicación | `./dfsha-cli stat /pruebas/grande.bin` y `cluster --admin-key ...` | bloques repartidos en ≥2 nodos (3 al terminar la réplica asíncrona); verifíquenlo mirando los directorios de datos de los nodos | captura del manifiesto |
-| 3 | Caída de un nodo | en n1: `docker stop dfsha-n1`; seguir leyendo/escribiendo | lecturas y escrituras siguen; tras ~20 s el nodo se marca caído y se repara la réplica faltante | log del líder + `get` correcto durante la caída. Reiniciar con `docker start dfsha-n1` |
-| 4 | Reinicio automático | en n2: `docker kill dfsha-n2`; esperar 10 s; `docker ps` | Docker lo levanta solo (`--restart unless-stopped`) y el nodo vuelve al clúster | captura de `docker ps` antes/después |
-| 5 | Réplica desconectada | en n3: `docker pause dfsha-n3`, escribir un archivo, `docker unpause dfsha-n3` | la escritura confirma con 2 acuses; n3 se pone al día por blockreport/reparación | log |
-| 6 | Failover de controlador | `docker kill` del contenedor del líder (el log dice cuál) | nuevo líder en ~3–5 s; los metadatos se conservan; el cliente reintenta solo | tiempo medido + `ls` correcto |
-| 7 | Pérdida de mayoría | detener 2 de 3 controladores | las escrituras/lecturas de metadatos responden `503 UNAVAILABLE` (sistema CP, no inventa datos) | captura del error; luego recuperar con `docker start` y comprobar que vuelve |
-| 8 | Concurrencia | dos clientes escriben el mismo archivo | el segundo recibe `423 LOCKED`; lectores ven un snapshot consistente | salida de ambos |
-| 9 | Modificar 1 byte | `./dfsha-cli write /pruebas/grande.bin --offset 1000 --data "X"` | solo se reenvía el bloque afectado; versión anterior intacta | log: 1 bloque nuevo |
-| 10 | Seguridad | `curl` sin token a un nodo; `openssl s_client -connect 10.0.1.21:9001 -tls1_3`; buscar texto plano en el disco de un nodo (`grep -r` en `/var/lib/dfsha-data`) | 401/403; TLS 1.3; cero coincidencias de texto plano | capturas |
-| 11 | Agregar un nodo | seguir "Agregar un nodo de datos" del README | el nodo aparece solo y recibe bloques nuevos | `cluster` antes/después |
-
-Importante para el profesor (autoría y coherencia): cada captura debe corresponder a algo que realmente hicieron; guarden fecha y hora (usen `date` en la terminal).
-
-## 8. Mediciones de rendimiento (en la VM cliente)
-
-```bash
-python3 scripts/aws_bench.py --user ana --password clave12345 \
-    --size-mib 64 --reps 5 --blocks 1,4,8 --clients 1,2,4 --out results/aws_perf.csv
-```
-
-- Mide put/get (mediana y p95) para bloque de 1/4/8 MiB con 1 cliente y para 1/2/4 clientes simultáneos con bloque de 8 MiB, verifica el SHA-256 de cada archivo recuperado y también la latencia de metadatos (`stat`).
-- Es exactamente el patrón de `t_rendimiento` pero contra el clúster real. Con ≥5 repeticiones (lo que pide el PDF).
-- Pongan en el informe el tipo de instancia, región y que las cifras son de AWS (las de `results/` son de localhost y no son representativas).
-
-## 9. Recoger evidencia y apagar
-
-- Copien a su computador: `results/aws_perf.csv`, `docker logs dfsha-<id> > log-<id>.txt` de cada VM, y las capturas.
-- **Antes de apagar el lab**: no borren los volúmenes si quieren repetir una prueba (los datos están en `/var/lib/dfsha-*`). Al detener/iniciar el Learner Lab los contenedores vuelven solos por Docker (si `docker` está habilitado en `systemctl`) y las IP privadas se conservan.
-- El Learner Lab tiene presupuesto: apaguen las VMs cuando no las usen.
-
-## 10. Problemas frecuentes
+## 6. Si algo falla
 
 | Síntoma | Causa probable | Qué hacer |
 |---|---|---|
-| El contenedor sale al instante | falta un secreto en `env` o el archivo no es legible | `docker logs dfsha-<id>`; revisar `/opt/dfsha/env` |
-| `certificate verify failed` | `DFSHA_CA` no apunta a `ca.pem`, o el certificado del nodo no tiene su IP | regenerar ese nodo con `gen_certs.py --node` con la IP correcta |
-| Controladores no eligen líder | el 4321 está bloqueado en el security group, o IPs distintas en `cluster.json` | revisar el SG (origen = el propio SG) y que `cluster.json` sea idéntico |
-| Nodos no aparecen | `--advertise` con IP equivocada o 9001 bloqueado | revisar el comando de `run_datanode.sh` y el SG |
-| `UNAVAILABLE` permanente | menos de 2 controladores vivos | levantar controladores con `docker start` |
-| `docker kill` no reinicia el contenedor | contenedor creado sin `--restart` | recrear con el script de despliegue |
+| `Credenciales de AWS inválidas o vencidas` | el laboratorio se reinició o pasaron 4 h | copiar de nuevo el bloque «AWS CLI» a `~/.aws/credentials` |
+| `InvalidKeyPair.NotFound` | la llave no se llama `vockey` | `KEY_NAME=<nombre> bash deploy/aws_crear_vms.sh` |
+| `VcpuLimitExceeded` / `InsufficientInstanceCapacity` | límite del laboratorio o falta de capacidad | `INSTANCE_TYPE=t3.micro bash …` (puede ser lento) o esperar y repetir |
+| `Permission denied (publickey)` | `SSH_KEY` o `SSH_USER` incorrectos | revisar la ruta; en Ubuntu use `SSH_USER=ubuntu` |
+| `Connection timed out` en SSH | su IP cambió y el SG ya no la permite | agregar su IP actual al puerto 22 del grupo `dfsha-sg` en la consola |
+| `desplegar.sh` dice «FALLÓ» en una VM | Docker no instalado o error de construcción | leer `deploy/logs/<vm>.log` |
+| El clúster no queda listo | falta un puerto en el SG o un secreto | `sudo docker logs dfsha-c1` en vm1; revisar puertos 8001/4321/9001 |
+| `certificate verify failed` | la IP privada de una VM cambió | `rm -r certs deploy/secrets.generated.env` y repetir `desplegar.sh` |
+| `UNAVAILABLE` permanente | menos de 2 controladores vivos | `sudo docker start dfsha-cX` en la VM correspondiente |
 
-## Plan B si hay pocas instancias
+Cuando el laboratorio se detiene, las IP privadas se conservan pero las públicas cambian: `bash deploy/aws_crear_vms.sh iniciar` actualiza `hosts.txt`. Los contenedores vuelven solos porque Docker está habilitado y la política es `--restart unless-stopped`; el primer arranque tarda un par de minutos.
 
-Si el laboratorio solo permite, por ejemplo, 5 instancias: pongan **un controlador y un nodo de datos en la misma VM** (puertos distintos: 8001/4321 y 9001, ya no chocan) hasta tener 3 VMs con controlador y 4 nodos de datos repartidos. Anótenlo en el informe como limitación del laboratorio. No pongan dos controladores en la misma VM: perderían la tolerancia a fallos (una sola VM caída quitaría la mayoría).
+## 7. Plan B: todo a mano (si falla la AWS CLI)
+
+1. En la consola: **EC2 → Lanzar instancias**, 4 veces: Amazon Linux 2023, `t3.small`, 20 GB, llave `vockey`, mismo grupo de seguridad (SSH desde su IP; TCP 8001, 4321 y 9001 con origen el propio grupo). Pónganles el nombre `dfsha-vm1` … `dfsha-vm4`.
+2. Copien `deploy/hosts.example.txt` a `deploy/hosts.txt` y pongan las IP privadas y públicas de cada VM (los roles se dejan igual).
+3. Sigan desde el comando 2 (`desplegar.sh`).
+
+## 8. Despliegue manual (sin `desplegar.sh`), por si hace falta entender o depurar
+
+En cada VM: `sudo mkdir -p /opt/dfsha/certs /var/lib/dfsha-state /var/lib/dfsha-data`, copiar a `/opt/dfsha/` el `cluster.json` y los `certs/ca.pem` y `certs/<vm>/server.pem|key`, crear `/opt/dfsha/env` con `DFSHA_CLUSTER_KEY` (igual en todas), `DFSHA_ADMIN_KEY` (controladores) y `DFSHA_NODE_KEY` (nodo de datos), y ejecutar `sudo docker build -t dfsha .`, `sudo bash deploy/run_controller.sh c1 <ip privada>` y `sudo bash deploy/run_datanode.sh n1 <ip privada>`. `desplegar.sh` hace exactamente esto por SSH.
