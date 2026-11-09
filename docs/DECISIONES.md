@@ -62,4 +62,5 @@ Arquitectura asignada: **Opción 1** (cliente/servidor con servicio distribuido 
 - El cifrado no es de extremo a extremo: el cliente envía el bloque en claro dentro de TLS y el nodo lo cifra con su llave maestra (en variable de entorno).
 - El canal Raft entre controladores se cifra con la clave de clúster (PySyncObj), no con TLS.
 - Un líder aislado puede atender lecturas de metadatos desactualizadas hasta ~8 s (ver D10).
+- En el despliegue de AWS Academy, controlador y nodo de datos comparten VM (4 VMs en total, por presupuesto y límites del laboratorio): la caída de una VM tumba a la vez un controlador y un nodo de datos. El sistema tolera esa caída (quedan 2 de 3 controladores y 3 nodos de datos), pero el aislamiento de fallas es menor que con máquinas dedicadas.
 - El reinicio automático de contenedores depende de la política `--restart unless-stopped`; una parada manual (`docker stop`) no se reinicia sola.
